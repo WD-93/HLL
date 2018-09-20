@@ -1,0 +1,20 @@
+
+module Interp where
+
+import Ecomp
+
+--TODO: define simple main HLL interpreter, extract the symbol addresses and
+--use them as constants in the compiler contract!
+
+--Until then, simple instruction defs
+--Assume on instruction entry the stack looks like:
+--PC, HP, o1-o7, r1-r7
+
+--Note that that's not final: HP might be replaced with MSIZE, jump address,
+--bytecode cache and stack pointer registers could be added.
+
+--n = the number of bytes to pop off
+dispatch :: Integer -> C() 
+dispatch n = do
+  void + fromInteger n --Increments PC by n
+  jump $ mload (dup 1) & 0xffff
