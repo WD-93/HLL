@@ -109,6 +109,11 @@ pushN = ifam 32 "Too many bytes to push" op_PUSH
 dup = ifam 16 "Too high stack offset in DUP" op_DUP
 swap = ifam 16 "Too high stack offset in SWAP" op_SWAP
 
+i1 :: Int -> C() -> C()
+i1 opcode = (>> byte opcode)
+i2 :: Int -> C() -> C() -> C()
+i2 opcode a b = a >> b >> byte opcode
+
 pop = byte op_POP
 
 place_jumpdest l = place l >> byte op_JUMPDEST
@@ -125,10 +130,10 @@ labelExpr8 l = do n <- lookupLabel l
                   pushN 1
                   byte n
 jump_ :: C() -> C()
-jump_ = (>> byte op_JUMP)
+jump_ = i1 op_JUMP
 --Need to know arg ordering for multi-arg instructions!
 jumpi_ :: C() -> C() -> C()
-jumpi_ e jd = e >> jd >> byte op_JUMPI
+jumpi_ = i2 op_JUMPI
 
 jump = jump_ . labelExpr16
 jumpi e = jumpi_ e . labelExpr16
@@ -149,17 +154,18 @@ instance Num (C a) where
 
 --Logops
 (&) :: C() -> C() -> C()
-a & b = a >> b >> byte op_AND
+(&) = i2 op_AND
 (|||) :: C() -> C() -> C()
-(|||) a b = a >> b >> byte op_OR
+(|||) = i2 op_OR
 --Bitwise not
-not_ a = a >> byte op_NOT
+not_ = i1 op_NOT
 
 --Memory access
 mload :: C() -> C()
-mload = (>> byte op_MLOAD)
+mload = i1 op_MLOAD
 mstore :: C() -> C() -> C()
-mstore a b = a >> b >> byte op_MSTORE
+mstore = i2 op_MSTORE
+mstore8 = i2 0x53
 
 --Loops
 dowhile :: C() -> C() -> C()
@@ -179,7 +185,16 @@ whilenot cond body = do
   place_jumpdest exit
 
 iszero :: C() -> C()
-iszero = (>> byte op_ISZERO)
+iszero = i1 op_ISZERO
+
+--Now CBB to define opcode names, maybe later
+
+--Calldata access
+calldataload = i1 0x35
+calldatasize = byte 0x36
+--TODO: find out arg ordering for calldatacopy and similar instrs
+calldatacopy from to len = do from; to; len; byte 0x37
+
 --Keep opcodes together and ordered, add incrementally as needed
 op_ADD = 1
 op_MUL = 2
