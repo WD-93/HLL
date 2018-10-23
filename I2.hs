@@ -9,15 +9,7 @@ BP, PC, HP, HPLim, ArrFocus, BSFocus, R1-3, O1-3, ICache
 Also note I have space for 256 instrs, forgot I could just double by adding lol
 Code size budget per instruction: <96 bytes
 -}
-bp = 1
-pc = 2
-hp = 3
-hpLim = 4
-arrFocus = 5 --Pointer to start of 8-elem array
-bsFocus = 6 --Pointer to start of 256-byte bytestring
-r1 = 7; r2 = 8; r3 = 9
-o1 = 10; o2 = 11; o3 = 12
-iCache = 13
+[bp,pc,hp,hpLim,arrFocus,bsFocus,r1,r2,r3,o1,o2,o3,iCache] = map Var [1..13]
 
 --Assume BP already points to next instruction
 --Note: BP should be subtracted because EVM is little-endian; start at the top
@@ -25,10 +17,10 @@ iCache = 13
 --The byte pointed to by (BP,PC): 32*PC - BP + 31, so for (31,0) it points to
 --byte 0.
 --Checked BYTE behaviour, it does indeed index in the expected order.
-dispatch = do
-  dup iCache ! dup (bp + 1) --Get opcode
-  mload $ void + dup 1 --Double to get pointer into JT, then fetch
-  jump_ (void & 0xffff) --Mask out jump address, jump
+dispatch =
+  jump_ $
+    (mload $
+     (dupVar iCache ! dupVar bp) + dup 1) & 0xffff
   --Total gas: 32, 3 less than without BP and ICache
   --Code size: 3 + 3 + 6 = 12
 
@@ -61,7 +53,7 @@ hlmOp1 op rA rB = do
 --instructions.
 instructionSet :: [(Label,C())] -> C()
 instructionSet defs = do
-  sequence_ [place_jumpdest label >> code | (label,code) <- defs]
+  sequence_ [place_jumpdest label >> setSO 0 >> code | (label,code) <- defs]
   place "JUMPTABLE"
   sequence_ [do n <- lookupLabel label
                 byte (n `div` 256)
@@ -93,7 +85,7 @@ hlmAssign rA rB = do
 --Note: unreliable for BP < 1.
 imm8 = do
   bp -= 1
-  dup iCache ! dup (bp + 1)
+  dupVar iCache ! dupVar bp
   --Cost: 15, still cheaper than using PC
 {-With PC:
 sub 1
@@ -110,7 +102,7 @@ hlmMicroJump (+) = do
 --BP (+/-)= imm8 * r
 --r /= 0|1 is permitted
 hlmMicroIJump op r = do
-  assign op bp (imm8 * dup (r + 1))
+  assign op bp (imm8 * dupVar r)
   dispatch
 
 --PC (+/-)= imm8
@@ -118,20 +110,21 @@ hlmMicroIJump op r = do
 --No, keep BP at same offset and just refetch ICache.
 longJump (+) = do
   assign (+) pc imm8
-  set iCache $ mload $ dup pc
+  set iCache $ mload $ dupVar pc
+  pop
   dispatch
 
 --PC = r1
 dynJump = do
   pop; pop --pop BP and PC
-  dup (r1 - 2)
+  dupVar r1
   31
   dispatch
 
 --Bit ops, TODO use a library for this?
-mask numBits = 2 ^ numBits - 1
-a << n = a * 2 ^ n
-a >>. n = a `div` (2 ^ n)
+mask numBits = fromInteger (2 ^ numBits - 1)
+a << n = a * fromInteger (2 ^ n)
+a >>. n = a `div` fromInteger (2 ^ n)
 invert256 n = mask 256 - n
 
 --Do ADDMOD and MULMOD deserve their own instruction?
@@ -149,10 +142,8 @@ typeTag = (! 31)
 --Masks out the refTag but doesn't shift
 refTagMask = mask 32 << 216 
 --Check typeTag is tag and refTag is 0
-checkTag tag e = do
-  e & fromInteger (mask 40 << 216) --mask out typeTag and refTag
-  fromInteger (tag << 248) --pattern to compare with
-  eq
+checkTag tag e = (e & fromInteger (mask 40 << 216)) ==? theTag tag
+theTag n = fromInteger (n << 248)
 
 --Array
 --Layout: {byte tag = 1, ..., uint16 mask (lowest 5 bits 0), uint16 ptr}
@@ -174,14 +165,53 @@ dispatch
 -}
 --Code inefficient instruction first, improve later...
 newArray = do --relevant regs: HP, HPLim, R1, O1
-  fail <- label
-  dup r1 & invert256 (mask 5) --mask
-  dup 1 + dup (hp + 2) + 32 --next byte beyond array
-  dup 1 >? undefined
+  oldHP <- newVar $ dupVar hp
+  lenBytes <- newVar $ dupVar r1 & invert256 (mask 5)
+  newHP <- newVar $ dupVar hp + dupVar lenBytes + 32
+  --Check if there is enough space in heap...
+  ifte (dupVar newHP >? dupVar hpLim)
+    (do set r1 1; pop --Success! Now to construct the Array
+        --{tag=1,mask=lenBytes,ptr=oldHP}
+        swapVar hp --set hp to newHP
+        pop --remove newHP
+        void << 16 --shift lenBytes to the correct position
+        void + void --add lenBytes to oldHP, consuming it
+        void + theTag 1 --add the type tag, now oldHP = the array
+        swapVar o1
+        pop --remove oldHP; the stack is now restored
+        dispatch
+    )
+    (set r1 0 >> clearStack >> dispatch)
+  
 --Global data in memory:
 --0: JUMPTABLE - 8 words, codecopy it in init.
---char* 512: refCounter, cache it from storage
---TODO allocPtr for file system
---nonce for contract creation
+--Before JT, which starts as the lowest two bytes at *0, there are 30 free
+--bytes that could be used for globals.
+--32-bit refCounter, cache it from storage
+--TODO 32-bit allocPtr for file system
+--32-bit nonce for contract creation
 --Global region struct
 --Cache, taskQueue
+
+init_hp :: Num a => a
+init_hp = 542 --For now
+hlm_init = do
+  --Write JUMPTABLE to bytes 30..
+  codecopy 30 (labelExpr16 "JUMPTABLE") 512
+  --Initial bytestring length passed as first 16 bits of calldata
+  initBSLen <- newVar $ calldataload 0 / fromInteger (1 << 240)
+  --Copy calldata to bytestring
+  calldatacopy init_hp 2 (dupVar initBSLen)
+  --initBSLen = initial bytestring struct
+  void << 16
+  void + fromInteger (theTag 2 + init_hp)
+  --Init regs
+  mload init_hp --iCache
+  0 --o3
+  0 --o2
+  dupVar initBSLen --o1
+  0; 0; 0 --r3-r1
+  0 --bsFocus; todo allocate 256-len BS and put it here
+  0 --arrFocus; todo allocate 8-element Array and put a Balance in it
+  mask 16 --hpLim; pointers are 16-bit
+  dupVar undefined

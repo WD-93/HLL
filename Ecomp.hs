@@ -19,7 +19,10 @@ data Env = Env {label_ctr :: Int,
                 text_offset :: Int,
                 syms :: Syms,
                 future_syms :: Syms,
-                prog_text :: Program}
+                prog_text :: Program,
+                --Stack variable extension
+                stackOffset :: Integer
+                }
          deriving (Eq,Ord,Read,Show)
 --This also makes it easy to set one var at a time and extend with new vars!
 type Program = [Integer]
@@ -38,6 +41,8 @@ data C a where
   FullEnv :: C Env --Used for debugging.
   Return :: a -> C a
   (:>>=) :: C a -> (a -> C b) -> C b
+  GetStackOffset :: C Integer
+  SetStackOffset :: Integer -> C ()
 --Where is the state put? The interpreter.
 
 interpret :: C a -> (a,Env)
@@ -46,7 +51,9 @@ interpret c = let (a,env) = interp envInit c
                                  text_offset = 0,
                                  syms = [],
                                  future_syms = syms env, --TIME TRAVEL!!
-                                 prog_text = []}
+                                 prog_text = [],
+                                 stackOffset = 0
+                                 }
               in (a,env{syms = reverse $ syms env,
                         prog_text = reverse $ prog_text env})
 --After refactoring this is just a State monad... oh well.
@@ -70,6 +77,10 @@ interp env =
        c :>>= f ->
          do let (a,env') = interp env c
             interp env' (f a)
+       GetStackOffset ->
+         (stackOffset env, env)
+       SetStackOffset n ->
+         ((), env{stackOffset = n})
 
 instance Monad C where
   (>>=) = (:>>=)
@@ -87,7 +98,7 @@ instance Applicative C where
 
 label = NewLabel
 (=:) :: Label -> Integer -> C()
-(=:) = (:=) --Note labels can be used to set small constants as well
+(=:) = (:=) --Note labels can be used to #define constants as well
 byte = Byte
 offset = GetTextOffset
 lookupLabel = LookupLabel
@@ -97,6 +108,10 @@ place l = do n <- offset
              l =: fromIntegral n
 void :: C()
 void = return () --the empty expression: void + 3 adds 3 to top of stack.
+
+getSO = GetStackOffset
+setSO = SetStackOffset
+incSO n = getSO >>= setSO . (+n)
 
 --Note: no mention of EVM code has been made so far: C is a general pattern!
 --Now we get to the EVM-specific parts
@@ -108,9 +123,9 @@ ifam lim err first n | n > lim = error $ err ++ " (" ++ show n ++ ")"
                      | otherwise = byte $ first + n - 1
 
 pushN :: Integer -> C ()
-pushN = ifam 32 "Too many bytes to push" op_PUSH
+pushN n = ifam 32 "Too many bytes to push" op_PUSH n >> incSO 1
 
-dup = ifam 16 "Too high stack offset in DUP" op_DUP
+dup n = ifam 16 "Too high stack offset in DUP" op_DUP n >> incSO 1
 --NOTE: Swap behaviour is subtly different from EVM!
 --The first argument refers to the stack offset, which starts at 1 with max 17.
 --swap 3 here becomes SWAP2 in EVM. This change is useful because it means
@@ -118,13 +133,19 @@ dup = ifam 16 "Too high stack offset in DUP" op_DUP
 swap 1 = void
 swap n = ifam 16 "Too high stack offset in SWAP" op_SWAP (n-1)
 
+--i0..iN are now all assumed to return 1 word
+i0 o = byte o >> incSO 1
 i1 :: Integer -> C() -> C()
 i1 opcode = (>> byte opcode)
 i2 :: Integer -> C() -> C() -> C()
-i2 opcode a b = a >> b >> byte opcode
-i3 op a b c = a >> i2 op b c
+i2 opcode a b = a >> b >> byte opcode >> incSO (-1)
+i3 op a b c = a >> i2 op b c >> incSO (-1)
+--For void instructions:
+i1_void o a = i1 o a >> incSO (-1)
+i2_void o a b = i2 o a b >> incSO (-1)
+i3_void o a b c = i3 o a b c >> incSO (-1)
 
-pop = byte op_POP
+pop = byte op_POP >> incSO (-1)
 
 place_jumpdest l = place l >> byte op_JUMPDEST
 jumpdest = do l <- label
@@ -140,10 +161,10 @@ labelExpr8 l = do n <- lookupLabel l
                   pushN 1
                   byte n
 jump_ :: C() -> C()
-jump_ = i1 op_JUMP
+jump_ = i1_void op_JUMP
 --Need to know arg ordering for multi-arg instructions!
 jumpi_ :: C() -> C() -> C()
-jumpi_ = i2 op_JUMPI
+jumpi_ = i2_void op_JUMPI
 
 jump = jump_ . labelExpr16
 jumpi e = jumpi_ e . labelExpr16
@@ -155,15 +176,17 @@ push n = push' 1 n
           then push' (len+1) (n `div` 256) >> byte (fromInteger n `rem` 256)
           else pushN len >> byte (fromInteger n)
 
+ru m = m >> return undefined
+ru2 opcode a b = ru $ i2 opcode (ru a) (ru b)
 instance Num (C a) where
-  fromInteger n = push n >> return undefined
-  a + b = a >> b >> byte op_ADD >> return undefined
-  a - b = a >> b >> byte op_SUB >> return undefined
-  a * b = a >> b >> byte op_MUL >> return undefined
+  fromInteger = ru . push
+  (+) = ru2 op_ADD
+  (-) = ru2 op_SUB
+  (*) = ru2 op_MUL
   abs = undefined; signum = undefined
 instance Fractional (C a) where
   fromRational r = fromInteger $ round r --Don't use this...
-  a / b = a >> b >> byte 0x04 >> return undefined
+  (/) = ru2 0x04
 
 --Logops
 (&) :: C() -> C() -> C()
@@ -176,10 +199,10 @@ not_ = i1 op_NOT
 
 --Memory access
 mload :: C() -> C()
-mload = i1 op_MLOAD
+mload = i1_void op_MLOAD
 mstore :: C() -> C() -> C()
-mstore = i2 op_MSTORE
-mstore8 = i2 0x53
+mstore = i2_void op_MSTORE
+mstore8 = i2_void 0x53
 
 --Byte op (note the name 'byte' is already taken)
 --Note: reversed argument order compared to the EVM's, to comply with the
@@ -188,19 +211,23 @@ mstore8 = i2 0x53
 
 --Stack variable assignment
 assign op v expr = do
-   swap v `op` expr
-   swap v 
+   swapVar v `op` expr
+   swapVar v 
 (+=) = assign (+)
 (-=) = assign (-)
 (*=) = assign (*)
 (=/) = assign (/)
 (&=) = assign (&)
 (|=) = assign (|||)
---Assumes expr pushes one element on the stack
+--Assigns last word of expr to v, discards the rest
+--Strange behaviour for diff < 0
 set v expr = do
+  --n <- getSO
   expr
-  swap (v+1)
-  pop
+  --n' <- getSO
+  --let diff = n' - n
+  swapVar v
+  --sequence_ [pop | _ <- [1..diff]]
 
 --Loops
 dowhile :: C() -> C() -> C()
@@ -219,6 +246,21 @@ whilenot cond body = do
   jump loop
   place_jumpdest exit
 
+--if_else construct, but true case falls through to false by default,
+--where it may have an incorrect stack offset
+ifte cond th el = do
+  else_ <- label
+  jumpi cond else_
+  n <- getSO
+  th
+  place_jumpdest else_
+  setSO n
+  el
+
+--Resets stack to offset 0 if it's >0
+clearStack = do n <- getSO
+                sequence_ [pop | _ <- [1..n]]
+
 iszero :: C() -> C()
 iszero = i1 op_ISZERO
 
@@ -226,32 +268,28 @@ iszero = i1 op_ISZERO
 
 --Calldata access
 calldataload = i1 0x35
-calldatasize = byte 0x36
-calldatacopy = i3 0x37
+calldatasize = i0 0x36
+calldatacopy = i3_void 0x37
 
 --TODO: place all instrs in order
 --Comparison
-lt = byte 0x10
-gt = byte 0x11
-slt = byte 0x12
-sgt = byte 0x13
-eq = byte 0x14
-
 (<?) = i2 0x10
 (>?) = i2 0x11
+(<.?) = i2 0x12 --SLT
+(>.?) = i2 0x13 --SGT
 (==?) = i2 0x14
 
-address = byte 0x30
+address = i0 0x30
 balance = i1 0x31
-origin = byte 0x32
-caller = byte 0x33
-callvalue = byte 0x34
+origin = i0 0x32
+caller = i0 0x33
+callvalue = i0 0x34
 
-codesize = byte 0x38
-codecopy = i3 0x39
-gasprice = byte 0x3a
+codesize = i0 0x38
+codecopy = i3_void 0x39
+gasprice = i0 0x3a
 extcodesize = i1 0x3b
-extcodecopy a b c d = do a; b; c; d; byte 0x3c
+extcodecopy a b c d = do a; b; c; d; byte 0x3c >> incSO (-4)
 
 
 --Keep opcodes together and ordered, add incrementally as needed
@@ -277,12 +315,28 @@ op_SWAP = 0x90
 
 --Stack offset extension idea (needed to make instruction coding less
 --tedious and error-prone):
---setOffset :: Int -> C()
+--setStackOffset :: Int -> C()
 --Modify iN_M to record stack effect; at the start of an instruction set it to
 --0.
 --getStackOffset :: C Int
 --newtype Var ~ Int
 --dupVar, swapVar :: E1 -> E1, newVar E1
+--At start of instruction SO = 0, registers are at offset 1..NumRegs
+--New vars are identified by their offset relative to the base pointer
+--(not to be confused with the byte pointer BP). They are negative if beyond
+--the regset, but if you temporarily consume part of it they may be positive
+--synonyms for registers.
+--setSO n >> newVar 3 should return Var (-n + 1), with SO = n+1
+newtype Var = Var Integer
+newVar :: C() -> C Var
+newVar e = do
+  e
+  off <- getSO
+  return $ Var $ (-off) + 1
+dupVar (Var n) = do
+  off <- getSO
+  dup (n + off)
+swapVar (Var n) = getSO >>= swap . (n+)
 --Stack effect assumes straight-line code with ijumps not branching.
 --Check stack effect dynamically at "compile time" rather than with types.
 
