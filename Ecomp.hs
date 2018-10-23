@@ -22,18 +22,19 @@ data Env = Env {label_ctr :: Int,
                 prog_text :: Program}
          deriving (Eq,Ord,Read,Show)
 --This also makes it easy to set one var at a time and extend with new vars!
-type Program = [Int]
-type Syms = [(Label,Int)]
+type Program = [Integer]
+type Syms = [(Label,Integer)]
+--Mapping syms to Integers allows you to #define addresses
 
 --GADT or shallow embedding? Try GADT first.
 
 --C for compile
 data C a where
   NewLabel :: C Label
-  (:=) :: Label -> Int -> C ()
-  Byte :: Int -> C ()
+  (:=) :: Label -> Integer -> C ()
+  Byte :: Integer -> C ()
   GetTextOffset :: C Int
-  LookupLabel :: Label -> C Int --That it's not (Maybe Int) is important!
+  LookupLabel :: Label -> C Integer --That it's not (Maybe Int) is important!
   FullEnv :: C Env --Used for debugging.
   Return :: a -> C a
   (:>>=) :: C a -> (a -> C b) -> C b
@@ -85,6 +86,7 @@ instance Applicative C where
   pure = return
 
 label = NewLabel
+(=:) :: Label -> Integer -> C()
 (=:) = (:=) --Note labels can be used to set small constants as well
 byte = Byte
 offset = GetTextOffset
@@ -92,27 +94,35 @@ lookupLabel = LookupLabel
 
 place :: Label -> C ()
 place l = do n <- offset
-             l =: n
+             l =: fromIntegral n
 void :: C()
 void = return () --the empty expression: void + 3 adds 3 to top of stack.
 
 --Note: no mention of EVM code has been made so far: C is a general pattern!
 --Now we get to the EVM-specific parts
 
-ifam :: Int -> String -> Int -> Int -> C ()
+ifam :: Integer -> String -> Integer -> Integer -> C ()
 ifam lim err first n | n > lim = error $ err ++ " (" ++ show n ++ ")"
+                     | n < 1 = error $ "Too low n in ifam " ++
+                               show (lim,err,first,n)
                      | otherwise = byte $ first + n - 1
 
-pushN :: Int -> C ()
+pushN :: Integer -> C ()
 pushN = ifam 32 "Too many bytes to push" op_PUSH
 
 dup = ifam 16 "Too high stack offset in DUP" op_DUP
-swap = ifam 16 "Too high stack offset in SWAP" op_SWAP
+--NOTE: Swap behaviour is subtly different from EVM!
+--The first argument refers to the stack offset, which starts at 1 with max 17.
+--swap 3 here becomes SWAP2 in EVM. This change is useful because it means
+--assignments to the top stack variable automatically omit a swap.
+swap 1 = void
+swap n = ifam 16 "Too high stack offset in SWAP" op_SWAP (n-1)
 
-i1 :: Int -> C() -> C()
+i1 :: Integer -> C() -> C()
 i1 opcode = (>> byte opcode)
-i2 :: Int -> C() -> C() -> C()
+i2 :: Integer -> C() -> C() -> C()
 i2 opcode a b = a >> b >> byte opcode
+i3 op a b c = a >> i2 op b c
 
 pop = byte op_POP
 
@@ -124,8 +134,8 @@ jumpdest = do l <- label
 --jump8. There can only be a few of them, so it's not that inconvenient.
 labelExpr16 l = do n <- lookupLabel l
                    pushN 2
-                   byte (n `div` 256)
-                   byte (n `rem` 256)
+                   byte $ fromInteger $ n `div` 256
+                   byte $ fromInteger $ n `rem` 256
 labelExpr8 l = do n <- lookupLabel l
                   pushN 1
                   byte n
@@ -151,13 +161,17 @@ instance Num (C a) where
   a - b = a >> b >> byte op_SUB >> return undefined
   a * b = a >> b >> byte op_MUL >> return undefined
   abs = undefined; signum = undefined
+instance Fractional (C a) where
+  fromRational r = fromInteger $ round r --Don't use this...
+  a / b = a >> b >> byte 0x04 >> return undefined
 
 --Logops
 (&) :: C() -> C() -> C()
 (&) = i2 op_AND
 (|||) :: C() -> C() -> C()
 (|||) = i2 op_OR
---Bitwise not
+(^^) = i2 0x18 --XOR
+--Bitwise not, for logical not use iszero
 not_ = i1 op_NOT
 
 --Memory access
@@ -166,6 +180,27 @@ mload = i1 op_MLOAD
 mstore :: C() -> C() -> C()
 mstore = i2 op_MSTORE
 mstore8 = i2 0x53
+
+--Byte op (note the name 'byte' is already taken)
+--Note: reversed argument order compared to the EVM's, to comply with the
+--ordinary indexing argument order value !! index.
+(!) = flip $ i2 0x1a
+
+--Stack variable assignment
+assign op v expr = do
+   swap v `op` expr
+   swap v 
+(+=) = assign (+)
+(-=) = assign (-)
+(*=) = assign (*)
+(=/) = assign (/)
+(&=) = assign (&)
+(|=) = assign (|||)
+--Assumes expr pushes one element on the stack
+set v expr = do
+  expr
+  swap (v+1)
+  pop
 
 --Loops
 dowhile :: C() -> C() -> C()
@@ -192,8 +227,32 @@ iszero = i1 op_ISZERO
 --Calldata access
 calldataload = i1 0x35
 calldatasize = byte 0x36
---TODO: find out arg ordering for calldatacopy and similar instrs
-calldatacopy from to len = do from; to; len; byte 0x37
+calldatacopy = i3 0x37
+
+--TODO: place all instrs in order
+--Comparison
+lt = byte 0x10
+gt = byte 0x11
+slt = byte 0x12
+sgt = byte 0x13
+eq = byte 0x14
+
+(<?) = i2 0x10
+(>?) = i2 0x11
+(==?) = i2 0x14
+
+address = byte 0x30
+balance = i1 0x31
+origin = byte 0x32
+caller = byte 0x33
+callvalue = byte 0x34
+
+codesize = byte 0x38
+codecopy = i3 0x39
+gasprice = byte 0x3a
+extcodesize = i1 0x3b
+extcodecopy a b c d = do a; b; c; d; byte 0x3c
+
 
 --Keep opcodes together and ordered, add incrementally as needed
 op_ADD = 1
@@ -215,6 +274,17 @@ op_JUMPDEST = 0x5b
 op_PUSH = 0x60
 op_DUP = 0x80
 op_SWAP = 0x90
+
+--Stack offset extension idea (needed to make instruction coding less
+--tedious and error-prone):
+--setOffset :: Int -> C()
+--Modify iN_M to record stack effect; at the start of an instruction set it to
+--0.
+--getStackOffset :: C Int
+--newtype Var ~ Int
+--dupVar, swapVar :: E1 -> E1, newVar E1
+--Stack effect assumes straight-line code with ijumps not branching.
+--Check stack effect dynamically at "compile time" rather than with types.
 
 --Tests, interesting cases
 
